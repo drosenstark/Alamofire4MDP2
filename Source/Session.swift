@@ -72,6 +72,10 @@ open class Session {
     var activeRequests: Set<Request> = []
     /// Completion events awaiting `URLSessionTaskMetrics`.
     var waitingCompletions: [URLSessionTask: () -> Void] = [:]
+    #if os(iOS) || os(tvOS) || os(watchOS)
+    var backgroundAssertion: BackgroundAssertion?
+    #endif
+    
 
     /// Creates a `Session` from a `URLSession` and other parameters.
     ///
@@ -986,6 +990,50 @@ open class Session {
     }
 
     // MARK: Perform
+    
+    #if os(iOS) || os(tvOS) || os(watchOS)
+    final class BackgroundAssertion {
+        @Protected private var isActive = false
+        
+        private let group: DispatchGroup
+        
+        deinit {
+            if isActive { group.leave() }
+        }
+        
+        init(on queue: DispatchQueue) {
+            group = DispatchGroup()
+            ProcessInfo().performExpiringActivity(withReason: "org.alamofire.session.backgroundAssertion") { [self] isExpired in
+                if isExpired {
+                    guard isActive else { return }
+
+                    group.leave()
+                } else {
+                    isActive = true
+                    group.enter()
+                    group.notify(queue: queue) { [self] in
+                        print("*** BackgroundAssertion complete.")
+                        isActive = false
+                    }
+                    // Block until canceled or expired.
+                    group.wait()
+                }
+            }
+        }
+        
+        func cancel() {
+            group.leave()
+        }
+    }
+    #endif
+    
+    func takeBackgroundAssertionIfNecessary() {
+        #if os(iOS) || os(tvOS) || os(watchOS)
+        guard backgroundAssertion == nil else { return }
+        
+        backgroundAssertion = BackgroundAssertion(on: rootQueue)
+        #endif
+    }
 
     /// Starts performing the provided `Request`.
     ///
@@ -993,7 +1041,11 @@ open class Session {
     func perform(_ request: Request) {
         rootQueue.async {
             guard !request.isCancelled else { return }
+            
+            self.takeBackgroundAssertionIfNecessary()
 
+            self.eventMonitor.requestWillPerform(request)
+            
             self.activeRequests.insert(request)
 
             self.requestQueue.async {
@@ -1181,6 +1233,10 @@ extension Session: RequestDelegate {
 
     public func cleanup(after request: Request) {
         activeRequests.remove(request)
+        #if os(iOS) || os(tvOS) || os(watchOS)
+        backgroundAssertion?.cancel()
+        backgroundAssertion = nil
+        #endif
     }
 
     public func retryResult(for request: Request, dueTo error: AFError, completion: @escaping (RetryResult) -> Void) {
